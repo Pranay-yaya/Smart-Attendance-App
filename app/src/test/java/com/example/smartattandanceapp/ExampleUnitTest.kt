@@ -1,4 +1,4 @@
-package com.example.smartattandanceapp
+package com.example.smartattendanceapp
 
 import org.junit.Test
 
