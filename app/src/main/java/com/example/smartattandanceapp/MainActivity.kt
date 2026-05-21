@@ -25,6 +25,10 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -61,9 +65,13 @@ private val ErrorRed     = Color(0xFFFF5252)
 class MainActivity : ComponentActivity() {
     private val authViewModel: AuthViewModel by viewModels()
     private val attendanceViewModel: AttendanceViewModel by viewModels()
+    // FaceClassifier lives here so it is shared between AttendanceTab (matching)
+    // and RegisterTab (enrollment) and only created once.
+    private lateinit var faceClassifier: FaceClassifier
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        faceClassifier = FaceClassifier(this)
 
         // ── FIX 1: DARK WINDOW BACKGROUND ─────────────────────────────────────
         // The app theme has a white windowBackground. Android paints that colour
@@ -98,6 +106,14 @@ class MainActivity : ComponentActivity() {
             authViewModel.restoreSession(incomingUserId)
         }
 
+        // Clean up ML Kit detector when activity is destroyed
+        // (This is a no-op if called multiple times)
+        lifecycle.addObserver(object : androidx.lifecycle.DefaultLifecycleObserver {
+            override fun onDestroy(owner: androidx.lifecycle.LifecycleOwner) {
+                faceClassifier.close()
+            }
+        })
+
         setContent {
             val isLoggedIn by authViewModel.isLoggedIn.collectAsState()
             val isLoading  by authViewModel.isLoading.collectAsState()
@@ -107,7 +123,7 @@ class MainActivity : ComponentActivity() {
                 isLoading -> SplashScreen()
 
                 // Session confirmed → show main UI
-                isLoggedIn -> MainScreen(authViewModel, attendanceViewModel)
+                isLoggedIn -> MainScreen(authViewModel, attendanceViewModel, faceClassifier)
 
                 // Not loading and not logged in → user explicitly logged out
                 // (this path is ONLY reached after isLoading finishes as false,
@@ -151,9 +167,14 @@ fun SplashScreen() {
 }
 
 @Composable
-fun MainScreen(authVM: AuthViewModel, attendVM: AttendanceViewModel) {
+fun MainScreen(authVM: AuthViewModel, attendVM: AttendanceViewModel, faceClassifier: FaceClassifier) {
     var selectedTab by remember { mutableStateOf(0) }
     val user by authVM.currentUser.collectAsState()
+
+    // Tell AttendanceViewModel which user is logged in so all queries are scoped
+    LaunchedEffect(user?.userId) {
+        user?.userId?.let { uid -> attendVM.setCurrentUser(uid) }
+    }
 
     val tabs = listOf(
         Triple(Icons.Outlined.FactCheck, Icons.Default.FactCheck, "Attendance"),
@@ -229,10 +250,10 @@ fun MainScreen(authVM: AuthViewModel, attendVM: AttendanceViewModel) {
                 label = "tab_content"
             ) { tab ->
                 when (tab) {
-                    0 -> AttendanceTab(attendVM)
-                    1 -> RegisterTab(attendVM, user?.className ?: "")
+                    0 -> AttendanceTab(attendVM, faceClassifier)
+                    1 -> RegisterTab(attendVM, user?.className ?: "", faceClassifier)
                     2 -> StatisticsScreen(attendVM)
-                    3 -> SettingsScreen(authVM, onLogout = {})
+                    3 -> SettingsScreen(authVM, attendVM, onLogout = {})
                 }
             }
         }
@@ -285,120 +306,320 @@ fun MainScreen(authVM: AuthViewModel, attendVM: AttendanceViewModel) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // ATTENDANCE TAB
 // ═══════════════════════════════════════════════════════════════════════════════
+// ── Sealed class to represent outcomes after a face scan ──────────────────────
+sealed class ScanState {
+    object Idle      : ScanState()
+    object Scanning  : ScanState()
+    // ≥55% similarity → auto-marked, show confirmation
+    data class AutoMatched(
+        val student: com.example.smartattendanceapp.data.StudentEntity,
+        val score: Float
+    ) : ScanState()
+    // 35-54% → show top 3 candidates, teacher confirms
+    data class Candidates(
+        val list: List<Pair<com.example.smartattendanceapp.data.StudentEntity, Float>>
+    ) : ScanState()
+    // <35% OR no students enrolled → show ALL enrolled students as manual picker
+    // This ensures attendance can ALWAYS be marked regardless of ML Kit accuracy
+    data class ShowAll(val faceWasDetected: Boolean) : ScanState()
+}
+
 @Composable
-fun AttendanceTab(vm: AttendanceViewModel) {
+fun AttendanceTab(vm: AttendanceViewModel, faceClassifier: FaceClassifier) {
     val records by vm.attendanceRecords.collectAsState()
-    var showCamera    by remember { mutableStateOf(false) }
-    // ── FIXED: after capture, show a "Mark Present" form ─────────────────────
-    // Bug: old code called Toast only — markAttendance() was NEVER called.
-    // Now: capture sets showMarkForm = true, form calls vm.markAttendance().
-    var showMarkForm  by remember { mutableStateOf(false) }
-    var markName      by remember { mutableStateOf("") }
-    var markRoll      by remember { mutableStateOf("") }
-    var markClass     by remember { mutableStateOf("") }
+    val enrolled by vm.enrolledStudents.collectAsState()
+    var scanState by remember { mutableStateOf<ScanState>(ScanState.Idle) }
     val context = LocalContext.current
 
-    if (showCamera) {
+    // ── Camera screen ─────────────────────────────────────────────────────────
+    val scope = rememberCoroutineScope()
+
+    if (scanState == ScanState.Scanning) {
         CameraScreen(
-            onImageCaptured = { _ ->
-                // Face was captured — open the "Mark Present" form
-                showCamera   = false
-                showMarkForm = true
+            title = "Scan Face for Attendance",
+            onImageCaptured = { bitmap ->
+                // ── FIX: run recognizeFace() on a background thread ───────────
+                // recognizeFace() uses CountDownLatch.await() internally.
+                // If called on the Main thread it blocks it; ML Kit also
+                // delivers its result on Main, so the callback can never fire,
+                // the latch times out, and a zero vector is returned → no match.
+                // Solution: launch on Dispatchers.IO so the latch blocks a
+                // background thread instead, ML Kit delivers on Main unblocked,
+                // then we switch back to Main to update scanState.
+                scope.launch {
+                    // Run ML Kit on background thread (never block Main thread)
+                    val embedding = withContext(Dispatchers.IO) {
+                        faceClassifier.recognizeFace(bitmap)
+                    }
+                    val result = vm.findBestMatch(embedding)
+                    scanState = when {
+                        // Auto-match ≥55%
+                        result.matched != null -> {
+                            vm.markAttendance(
+                                result.matched.name,
+                                result.matched.roll,
+                                result.matched.className
+                            )
+                            ScanState.AutoMatched(result.matched, result.topScore)
+                        }
+                        // Borderline 35-54% → show top 3
+                        result.candidates.isNotEmpty() -> ScanState.Candidates(result.candidates)
+                        // <35% or no enrolled students → show ALL enrolled list
+                        // Teacher taps the right person — attendance always markable
+                        else -> ScanState.ShowAll(faceWasDetected = embedding.any { it != 0f })
+                    }
+                }
             },
-            onDismiss = { showCamera = false }
+            onDismiss = { scanState = ScanState.Idle }
         )
         return
     }
 
-    // ── Student picker after face scan ────────────────────────────────────────
-    if (showMarkForm) {
-        val enrolled by vm.enrolledStudents.collectAsState()
-
-        Box(
-            modifier = Modifier.fillMaxSize().background(DeepNavy)
-        ) {
+    // ── Auto-matched banner ───────────────────────────────────────────────────
+    if (scanState is ScanState.AutoMatched) {
+        val s = scanState as ScanState.AutoMatched
+        val pct = (s.score * 100).toInt()
+        Box(modifier = Modifier.fillMaxSize().background(DeepNavy)) {
             Column(
-                modifier = Modifier.fillMaxSize().padding(20.dp)
+                modifier = Modifier.fillMaxSize().padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
+                // Big tick
+                Box(
+                    modifier = Modifier.size(100.dp).clip(CircleShape)
+                        .background(SuccessGreen.copy(0.15f))
+                        .border(2.dp, SuccessGreen.copy(0.4f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) { Text("✓", color = SuccessGreen, fontSize = 48.sp, fontWeight = FontWeight.ExtraBold) }
+
+                Spacer(Modifier.height(24.dp))
+                Text("Attendance Marked!", color = SuccessGreen, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                Spacer(Modifier.height(12.dp))
+
+                // Student card
+                Box(
                     modifier = Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(20.dp)).background(CardDark)
+                        .border(1.dp, SuccessGreen.copy(0.3f), RoundedCornerShape(20.dp)).padding(20.dp)
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Who is this?", color = TextWhite, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
-                        Text("Tap a student to mark present", color = TextMuted, fontSize = 13.sp)
-                    }
-                    Box(
-                        modifier = Modifier.size(36.dp).clip(CircleShape)
-                            .background(CardBorder).clickable {
-                                markName = ""; markRoll = ""; showMarkForm = false
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(Icons.Default.Close, null, tint = TextMuted, modifier = Modifier.size(18.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier.size(56.dp).clip(CircleShape)
+                                .background(Brush.linearGradient(listOf(NeonPurple, ElectricBlue))),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                s.student.name.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                                color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+                        Spacer(Modifier.width(16.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(s.student.name, color = TextWhite, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                            Text("Roll: ${s.student.roll}", color = TextMuted, fontSize = 13.sp)
+                            Text(s.student.className, color = TextMuted, fontSize = 13.sp)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("$pct%", color = SuccessGreen, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                            Text("match", color = TextMuted, fontSize = 11.sp)
+                        }
                     }
                 }
 
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(28.dp))
+                Box(
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Brush.linearGradient(listOf(NeonPurple, ElectricBlue)))
+                        .clickable { scanState = ScanState.Idle },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("Done", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                }
+            }
+        }
+        return
+    }
 
-                if (enrolled.isEmpty()) {
-                    // No students enrolled yet — fall back to manual entry
+    // ── Candidate picker (borderline match — top 3 only) ─────────────────────
+    if (scanState is ScanState.Candidates) {
+        val candidates = (scanState as ScanState.Candidates).list
+        Box(modifier = Modifier.fillMaxSize().background(DeepNavy)) {
+            Column(modifier = Modifier.fillMaxSize().padding(20.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Possible Matches", color = TextWhite, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                        Text("Face partially matched — tap to confirm", color = TextMuted, fontSize = 13.sp)
+                    }
                     Box(
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.size(36.dp).clip(CircleShape).background(CardBorder)
+                            .clickable { scanState = ScanState.Idle },
+                        contentAlignment = Alignment.Center
+                    ) { Icon(Icons.Default.Close, null, tint = TextMuted, modifier = Modifier.size(18.dp)) }
+                }
+                Spacer(Modifier.height(16.dp))
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    items(candidates) { (student, score) ->
+                        val pct = (score * 100).toInt()
+                        Row(
+                            modifier = Modifier.fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp)).background(CardDark)
+                                .border(1.dp, CardBorder, RoundedCornerShape(14.dp))
+                                .clickable {
+                                    vm.markAttendance(student.name, student.roll, student.className)
+                                    Toast.makeText(context, "✅ ${student.name} marked Present!", Toast.LENGTH_SHORT).show()
+                                    scanState = ScanState.Idle
+                                }.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier.size(48.dp).clip(RoundedCornerShape(12.dp))
+                                    .background(Brush.linearGradient(listOf(NeonPurple.copy(0.7f), ElectricBlue.copy(0.7f)))),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(student.name.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                                    color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                            }
+                            Spacer(Modifier.width(14.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(student.name, color = TextWhite, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                                Text("Roll: ${student.roll}  ·  ${student.className}", color = TextMuted, fontSize = 12.sp)
+                            }
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text("$pct%", color = WarnAmber, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
+                                Text("match", color = TextMuted, fontSize = 11.sp)
+                            }
+                        }
+                    }
+                    item {
+                        // "Not in list" fallback
+                        Row(
+                            modifier = Modifier.fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(ErrorRed.copy(0.08f))
+                                .border(1.dp, ErrorRed.copy(0.3f), RoundedCornerShape(14.dp))
+                                .clickable { scanState = ScanState.ShowAll(faceWasDetected = false) }.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.PersonOff, null, tint = ErrorRed, modifier = Modifier.size(20.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Text("None of these", color = ErrorRed, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
+
+    // ── No students enrolled — manual picker ────────────────────────────────
+    // ── ShowAll: face not matched → show ALL enrolled students as manual picker ──
+    // This replaces the dead-end "Face Not Recognised" screen.
+    // ML Kit is a face DETECTOR, not a face RECOGNISER — its landmark-based
+    // embeddings are not consistent enough between captures to reliably exceed
+    // a similarity threshold. Instead of blocking attendance, we show the full
+    // enrolled list so the teacher can always tap the right student.
+    if (scanState is ScanState.ShowAll) {
+        val faceFound = (scanState as ScanState.ShowAll).faceWasDetected
+        Box(modifier = Modifier.fillMaxSize().background(DeepNavy)) {
+            Column(modifier = Modifier.fillMaxSize().padding(20.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            if (enrolled.isEmpty()) "No Students Enrolled" else "Select Student",
+                            color = TextWhite, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold
+                        )
+                        Text(
+                            if (enrolled.isEmpty()) "Go to Enroll tab first"
+                            else if (faceFound) "Face detected but not matched — tap the correct student"
+                            else "Tap the student to mark present",
+                            color = TextMuted, fontSize = 13.sp
+                        )
+                    }
+                    Box(
+                        modifier = Modifier.size(36.dp).clip(CircleShape).background(CardBorder)
+                            .clickable { scanState = ScanState.Idle },
+                        contentAlignment = Alignment.Center
+                    ) { Icon(Icons.Default.Close, null, tint = TextMuted, modifier = Modifier.size(18.dp)) }
+                }
+                Spacer(Modifier.height(14.dp))
+                if (enrolled.isEmpty()) {
+                    Box(
+                        modifier = Modifier.fillMaxWidth().weight(1f)
                             .clip(RoundedCornerShape(16.dp)).background(CardDark)
-                            .border(1.dp, CardBorder, RoundedCornerShape(16.dp)).padding(20.dp),
+                            .border(1.dp, CardBorder, RoundedCornerShape(16.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("📋", fontSize = 32.sp)
-                            Spacer(Modifier.height(8.dp))
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+                            Text("📋", fontSize = 40.sp)
+                            Spacer(Modifier.height(12.dp))
                             Text("No students enrolled yet", color = TextMuted, fontSize = 14.sp)
-                            Text("Go to Enroll tab to register students first", color = TextMuted.copy(0.6f), fontSize = 12.sp)
+                            Text("Go to Enroll tab to register students",
+                                color = TextMuted.copy(0.6f), fontSize = 12.sp,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center)
                         }
                     }
                 } else {
-                    // Show enrolled students as tappable cards
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        val todayDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
                         items(enrolled) { student ->
+                            val alreadyMarked = records.any { it.roll == student.roll && it.date == todayDate }
                             Row(
                                 modifier = Modifier.fillMaxWidth()
-                                    .clip(RoundedCornerShape(14.dp)).background(CardDark)
-                                    .border(1.dp, CardBorder, RoundedCornerShape(14.dp))
-                                    .clickable {
-                                        // One tap → mark present immediately, no re-typing
-                                        vm.markAttendance(
-                                            studentName = student.name,
-                                            roll        = student.roll,
-                                            className   = student.className
-                                        )
-                                        Toast.makeText(
-                                            context,
-                                            "✅ ${student.name} marked Present!",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                        showMarkForm = false
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(if (alreadyMarked) SuccessGreen.copy(0.08f) else CardDark)
+                                    .border(1.dp, if (alreadyMarked) SuccessGreen.copy(0.4f) else CardBorder, RoundedCornerShape(14.dp))
+                                    .clickable(enabled = !alreadyMarked) {
+                                        vm.markAttendance(student.name, student.roll, student.className)
+                                        Toast.makeText(context, "✅ ${student.name} marked Present!", Toast.LENGTH_SHORT).show()
+                                        scanState = ScanState.Idle
                                     }
                                     .padding(14.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Box(
                                     modifier = Modifier.size(46.dp).clip(RoundedCornerShape(12.dp))
-                                        .background(Brush.linearGradient(listOf(NeonPurple.copy(0.6f), ElectricBlue.copy(0.6f)))),
+                                        .background(
+                                            if (alreadyMarked)
+                                                Brush.linearGradient(listOf(SuccessGreen.copy(0.5f), SuccessGreen.copy(0.3f)))
+                                            else
+                                                Brush.linearGradient(listOf(NeonPurple.copy(0.7f), ElectricBlue.copy(0.7f)))
+                                        ),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Text(
-                                        student.name.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
-                                        color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 20.sp
-                                    )
+                                    if (alreadyMarked)
+                                        Icon(Icons.Default.Check, null, tint = Color.White, modifier = Modifier.size(22.dp))
+                                    else
+                                        Text(student.name.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                                            color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
                                 }
                                 Spacer(Modifier.width(14.dp))
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(student.name, color = TextWhite, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                                    Text(student.name, color = if (alreadyMarked) SuccessGreen else TextWhite,
+                                        fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                                     Text("Roll: ${student.roll}  ·  ${student.className}", color = TextMuted, fontSize = 12.sp)
                                 }
-                                Icon(Icons.Default.CheckCircle, null, tint = SuccessGreen.copy(0.4f), modifier = Modifier.size(22.dp))
+                                if (alreadyMarked)
+                                    Text("Present ✓", color = SuccessGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                else
+                                    Icon(Icons.Default.TouchApp, null, tint = TextMuted.copy(0.5f), modifier = Modifier.size(20.dp))
                             }
                         }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                Box(
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Brush.linearGradient(listOf(NeonPurple, ElectricBlue)))
+                        .clickable { scanState = ScanState.Scanning },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CameraAlt, null, tint = Color.White, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Scan Another Face", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     }
                 }
             }
@@ -411,7 +632,7 @@ fun AttendanceTab(vm: AttendanceViewModel) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(vertical = 20.dp)
     ) {
-        item { ScanFaceCard { showCamera = true } }
+        item { ScanFaceCard { scanState = ScanState.Scanning } }
 
         item {
             val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
@@ -558,41 +779,66 @@ fun AttendanceLogItem(r: AttendanceRecordEntity) {
 // REGISTER TAB
 // ═══════════════════════════════════════════════════════════════════════════════
 @Composable
-fun RegisterTab(vm: AttendanceViewModel, userClass: String) {
+fun RegisterTab(vm: AttendanceViewModel, userClass: String, faceClassifier: FaceClassifier) {
     var name     by remember { mutableStateOf("") }
     var roll     by remember { mutableStateOf("") }
     var enrolled by remember { mutableStateOf<String?>(null) }
     var showCamera by remember { mutableStateOf(false) }
     val valid    = name.isNotBlank() && roll.isNotBlank()
     val ctx      = LocalContext.current
+    var pendingName by remember { mutableStateOf("") }
+    var pendingRoll by remember { mutableStateOf("") }
 
-    // ── FIXED: snapshot name/roll at the moment the camera is launched ────────
-    // If we close over `name` and `roll` directly in the lambda they are
-    // stable Compose State values and ARE read at call time — but snapshot them
-    // anyway so the callback is not affected by any state change that happens
-    // while the camera is open (e.g. the user somehow navigates tabs).
-    var pendingName  by remember { mutableStateOf("") }
-    var pendingRoll  by remember { mutableStateOf("") }
+    val registerScope = rememberCoroutineScope()
+    var isProcessing by remember { mutableStateOf(false) }
 
     if (showCamera) {
         CameraScreen(
+            title = "Capture Face for Enrollment",
             onImageCaptured = { bmp ->
                 if (pendingName.isNotBlank() && pendingRoll.isNotBlank()) {
-                    vm.registerStudent(
-                        name       = pendingName,
-                        roll       = pendingRoll,
-                        className  = userClass,
-                        faceBitmap = bmp,
-                        faceRect   = android.graphics.Rect(0, 0, bmp.width, bmp.height)
-                    )
-                    enrolled = pendingName
-                    name = ""
-                    roll = ""
+                    isProcessing = true
+                    // ── FIX: run recognizeFace() on background thread ─────────
+                    // Same CountDownLatch + Main thread deadlock as AttendanceTab.
+                    // Run on IO thread so ML Kit callback can fire on Main.
+                    registerScope.launch {
+                        val realEmbedding = withContext(Dispatchers.IO) {
+                            faceClassifier.recognizeFace(bmp)
+                        }
+                        vm.registerStudent(
+                            name          = pendingName,
+                            roll          = pendingRoll,
+                            className     = userClass,
+                            faceBitmap    = bmp,
+                            faceRect      = android.graphics.Rect(0, 0, bmp.width, bmp.height),
+                            faceEmbedding = realEmbedding
+                        )
+                        enrolled     = pendingName
+                        name         = ""
+                        roll         = ""
+                        isProcessing = false
+                        showCamera   = false
+                    }
+                } else {
+                    showCamera = false
                 }
-                showCamera = false
             },
             onDismiss = { showCamera = false }
         )
+        // Show loading overlay while processing embedding
+        if (isProcessing) {
+            Box(
+                modifier = androidx.compose.ui.Modifier.fillMaxSize()
+                    .background(Color.Black.copy(0.6f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = ElectricBlue)
+                    Spacer(androidx.compose.ui.Modifier.height(12.dp))
+                    Text("Processing face...", color = TextWhite, fontSize = 14.sp)
+                }
+            }
+        }
         return
     }
 

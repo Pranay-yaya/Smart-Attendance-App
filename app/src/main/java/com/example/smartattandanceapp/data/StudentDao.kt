@@ -5,53 +5,46 @@ import androidx.room.*
 @Dao
 interface StudentDao {
 
-    // ── Student operations ────────────────────────────────────────────────────
+    // ── Students ──────────────────────────────────────────────────────────────
 
-    /** Insert or replace a student (used during enrolment) */
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertStudent(student: StudentEntity)
 
-    /** Get all students in a specific class */
-    @Query("SELECT * FROM students WHERE className = :className")
-    suspend fun getStudentsByClass(className: String): List<StudentEntity>
+    // ── FIX: filter by owner so teachers only see their own students ──────────
+    @Query("SELECT * FROM students WHERE createdBy = :userId ORDER BY name ASC")
+    suspend fun getStudentsByOwner(userId: String): List<StudentEntity>
 
-    /** Get every enrolled student */
-    @Query("SELECT * FROM students")
-    suspend fun getAllStudents(): List<StudentEntity>
+    // Kept for legacy — not used in main flow anymore
+    @Query("SELECT * FROM students WHERE className = :className AND createdBy = :userId")
+    suspend fun getStudentsByClass(className: String, userId: String): List<StudentEntity>
 
-    // ── Attendance operations ─────────────────────────────────────────────────
+    @Query("SELECT * FROM students WHERE roll = :roll AND createdBy = :userId LIMIT 1")
+    suspend fun getStudentByRoll(roll: String, userId: String): StudentEntity?
 
-    /** Insert a new attendance record */
+    // ── Attendance records ────────────────────────────────────────────────────
+
     @Insert
     suspend fun insertAttendance(record: AttendanceRecordEntity)
 
-    /** Get all attendance records, newest first */
-    @Query("SELECT * FROM attendance_records ORDER BY timestamp DESC")
-    suspend fun getAllAttendance(): List<AttendanceRecordEntity>
+    // ── FIX: each user only sees records they created ─────────────────────────
+    @Query("SELECT * FROM attendance_records WHERE createdBy = :userId ORDER BY timestamp DESC")
+    suspend fun getAttendanceByOwner(userId: String): List<AttendanceRecordEntity>
 
-    /** Get attendance for a specific date */
-    @Query("SELECT * FROM attendance_records WHERE date = :date ORDER BY timestamp DESC")
-    suspend fun getAttendanceByDate(date: String): List<AttendanceRecordEntity>
+    // ── FIX: clear only THIS user's records, not everyone's ──────────────────
+    @Query("DELETE FROM attendance_records WHERE createdBy = :userId")
+    suspend fun deleteAttendanceByOwner(userId: String)
 
-    /** Get attendance for a specific class */
-    @Query("SELECT * FROM attendance_records WHERE className = :className ORDER BY timestamp DESC")
-    suspend fun getAttendanceByClass(className: String): List<AttendanceRecordEntity>
+    // ── Users ─────────────────────────────────────────────────────────────────
 
-    // ── User / auth operations ────────────────────────────────────────────────
-
-    /** Insert or replace a user (used for signup and demo-account seeding) */
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertUser(user: UserEntity)
 
-    /** Returns the user if userId + password match, null otherwise */
     @Query("SELECT * FROM users WHERE userId = :userId AND password = :password LIMIT 1")
     suspend fun loginUser(userId: String, password: String): UserEntity?
 
-    /** Lookup a user by ID only (used to check for duplicates during signup) */
     @Query("SELECT * FROM users WHERE userId = :userId LIMIT 1")
     suspend fun getUserById(userId: String): UserEntity?
 
-    /** Update user preferences (dark mode, etc.) */
     @Update
     suspend fun updateUser(user: UserEntity)
 }

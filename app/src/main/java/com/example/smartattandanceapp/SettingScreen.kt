@@ -23,6 +23,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.smartattendanceapp.data.UserEntity
 
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.TextStyle
+
 // ─── Design tokens ─────────────────────────────────────────────────────────────
 private val DeepNavy     = Color(0xFF0A0E1A)
 private val CardDark     = Color(0xFF111827)
@@ -38,6 +43,7 @@ private val TextMuted    = Color(0xFF6B7A99)
 @Composable
 fun SettingsScreen(
     authVM: AuthViewModel,
+    attendVM: AttendanceViewModel,    // needed for clearAllAttendance
     onLogout: () -> Unit
 ) {
     val user by authVM.currentUser.collectAsState()
@@ -45,6 +51,8 @@ fun SettingsScreen(
     var attendanceAlerts     by remember { mutableStateOf(true) }
     var biometricEnabled     by remember { mutableStateOf(false) }
     var showLogoutDialog     by remember { mutableStateOf(false) }
+    var showPasswordDialog   by remember { mutableStateOf(false) }
+    var showClearDialog      by remember { mutableStateOf(false) }
     var isDarkMode           by remember { mutableStateOf(user?.isDarkMode ?: false) }
 
     LazyColumn(
@@ -69,12 +77,17 @@ fun SettingsScreen(
         // Appearance
         item {
             SettingsGroup("Appearance") {
+                // ── FIX: show the toggle as Light Mode / Dark Mode based on current state
+                // If the user is already in dark mode, offer "Switch to Light Mode"
+                // If the user is in light mode, offer "Switch to Dark Mode"
+                // This way the option is always meaningful and never says "Dark Mode: on"
+                // while you are already looking at a dark screen.
                 SettingsToggleRow(
-                    icon = Icons.Default.DarkMode,
-                    iconTint = NeonPurple,
-                    title = "Dark Mode",
-                    subtitle = "Currently ${if (isDarkMode) "on" else "off"}",
-                    checked = isDarkMode,
+                    icon     = if (isDarkMode) Icons.Default.LightMode else Icons.Default.DarkMode,
+                    iconTint = if (isDarkMode) WarnAmber else NeonPurple,
+                    title    = if (isDarkMode) "Light Mode" else "Dark Mode",
+                    subtitle = if (isDarkMode) "Switch to light theme" else "Switch to dark theme",
+                    checked  = isDarkMode,
                     onCheckedChange = {
                         isDarkMode = it
                         authVM.updateUserTheme(it)
@@ -123,14 +136,14 @@ fun SettingsScreen(
                     iconTint = ElectricBlue,
                     title = "Change Password",
                     subtitle = "Update your login password"
-                ) { /* TODO: navigate to change password */ }
+                ) { showPasswordDialog = true }
                 Divider(color = CardBorder, thickness = 1.dp)
                 SettingsActionRow(
                     icon = Icons.Default.DeleteForever,
                     iconTint = ErrorRed,
                     title = "Clear Attendance Data",
-                    subtitle = "Remove all recorded attendance"
-                ) { /* TODO: confirm and clear */ }
+                    subtitle = "Remove all your recorded attendance"
+                ) { showClearDialog = true }
             }
         }
 
@@ -193,6 +206,49 @@ fun SettingsScreen(
         }
 
         item { Spacer(Modifier.height(8.dp)) }
+    }
+
+    // ── Change Password dialog ────────────────────────────────────────────────
+    if (showPasswordDialog) {
+        ChangePasswordDialog(
+            currentPasswordCheck = { pwd -> authVM.currentUser.value?.password == pwd },
+            onConfirm  = { newPwd -> authVM.changePassword(newPwd); showPasswordDialog = false },
+            onDismiss  = { showPasswordDialog = false }
+        )
+    }
+
+    // ── Clear attendance confirmation dialog ──────────────────────────────────
+    if (showClearDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearDialog = false },
+            containerColor   = CardDark,
+            titleContentColor = TextWhite,
+            textContentColor  = TextMuted,
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.DeleteForever, null, tint = ErrorRed, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Clear All Attendance?", fontWeight = FontWeight.Bold)
+                }
+            },
+            text = {
+                Text("This will permanently delete ALL your attendance records. Your enrolled students will NOT be affected.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        attendVM.clearAllAttendance()   // ← actually deletes from Room
+                        showClearDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ErrorRed)
+                ) { Text("Yes, Clear", color = Color.White, fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearDialog = false }) {
+                    Text("Cancel", color = TextMuted)
+                }
+            }
+        )
     }
 
     // Logout confirmation dialog
@@ -427,5 +483,92 @@ private fun SettingsInfoRow(
         Spacer(Modifier.width(14.dp))
         Text(title, color = TextWhite, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
         Text(value, color = TextMuted, fontSize = 12.sp)
+    }
+}
+
+// ── Change Password dialog (appended) ─────────────────────────────────────────
+@Composable
+private fun ChangePasswordDialog(
+    currentPasswordCheck: (String) -> Boolean,
+    onConfirm: (newPassword: String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var current  by remember { mutableStateOf("") }
+    var newPwd   by remember { mutableStateOf("") }
+    var confirm  by remember { mutableStateOf("") }
+    var errorMsg by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = CardDark,
+        titleContentColor = TextWhite,
+        textContentColor  = TextMuted,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Lock, null, tint = ElectricBlue, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Change Password", fontWeight = FontWeight.Bold)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                PasswordInputRow("Current Password", current)  { current = it }
+                PasswordInputRow("New Password",     newPwd)   { newPwd  = it }
+                PasswordInputRow("Confirm New",      confirm)  { confirm = it }
+                if (errorMsg.isNotEmpty()) {
+                    Text(errorMsg, color = ErrorRed, fontSize = 12.sp)
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    errorMsg = when {
+                        current.isBlank() || newPwd.isBlank() || confirm.isBlank() ->
+                            "All fields are required"
+                        !currentPasswordCheck(current) ->
+                            "Current password is incorrect"
+                        newPwd.length < 4 ->
+                            "New password must be at least 4 characters"
+                        newPwd != confirm ->
+                            "Passwords do not match"
+                        else -> {
+                            onConfirm(newPwd)
+                            return@Button
+                        }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue)
+            ) { Text("Update", color = DeepNavy, fontWeight = FontWeight.Bold) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = TextMuted) }
+        }
+    )
+}
+
+@Composable
+private fun PasswordInputRow(placeholder: String, value: String, onChange: (String) -> Unit) {
+    androidx.compose.foundation.layout.Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(46.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(DeepNavy)
+            .border(1.dp, CardBorder, RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(modifier = Modifier.weight(1f)) {
+            if (value.isEmpty()) Text(placeholder, color = TextMuted, fontSize = 13.sp)
+            androidx.compose.foundation.text.BasicTextField(
+                value     = value,
+                onValueChange = onChange,
+                textStyle = androidx.compose.ui.text.TextStyle(color = TextWhite, fontSize = 13.sp),
+                cursorBrush = SolidColor(ElectricBlue),
+                visualTransformation = PasswordVisualTransformation(),
+                modifier  = Modifier.fillMaxWidth()
+            )
+        }
     }
 }
