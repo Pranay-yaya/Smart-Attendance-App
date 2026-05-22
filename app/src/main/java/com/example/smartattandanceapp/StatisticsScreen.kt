@@ -37,12 +37,25 @@ private val WarnAmber    = Color(0xFFFFAB40)
 private val TextWhite    = Color(0xFFE8EAED)
 private val TextMuted    = Color(0xFF6B7A99)
 
+// ─── Light theme tokens ────────────────────────────────────────────────────────
+private val L_ScreenBg    = Color(0xFFF5F7FA)
+private val L_CardBg      = Color(0xFFFFFFFF)
+private val L_CardBorder  = Color(0xFFE2E8F0)
+private val L_TextPrimary = Color(0xFF1A202C)
+private val L_TextMuted   = Color(0xFF718096)
+
 enum class TimeFilter(val label: String) {
     ALL("All"), TODAY("Today"), WEEK("Week"), MONTH("Month")
 }
 
 @Composable
-fun StatisticsScreen(vm: AttendanceViewModel) {
+fun StatisticsScreen(vm: AttendanceViewModel, isLightMode: Boolean) {
+    val screenBg    = if (isLightMode) L_ScreenBg    else DeepNavy
+    val cardBg      = if (isLightMode) L_CardBg      else CardDark
+    val cardBorder  = if (isLightMode) L_CardBorder  else CardBorder
+    val textPrimary = if (isLightMode) L_TextPrimary else TextWhite
+    val textMuted   = if (isLightMode) L_TextMuted   else TextMuted
+
     val allRecords by vm.attendanceRecords.collectAsState()
     var selectedFilter by remember { mutableStateOf(TimeFilter.ALL) }
 
@@ -82,15 +95,15 @@ fun StatisticsScreen(vm: AttendanceViewModel) {
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .background(DeepNavy)
+            .background(screenBg)
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
         contentPadding = PaddingValues(vertical = 20.dp)
     ) {
         // Header
         item {
-            Text("Analytics", color = TextWhite, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
-            Text("Attendance insights & trends", color = TextMuted, fontSize = 13.sp)
+            Text("Analytics", color = textPrimary, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+            Text("Attendance insights & trends", color = textMuted, fontSize = 13.sp)
         }
 
         // Time filter pills
@@ -103,11 +116,11 @@ fun StatisticsScreen(vm: AttendanceViewModel) {
                             .clip(RoundedCornerShape(20.dp))
                             .background(
                                 if (selected) Brush.linearGradient(listOf(NeonPurple, ElectricBlue))
-                                else Brush.linearGradient(listOf(CardDark, CardDark))
+                                else Brush.linearGradient(listOf(cardBg, cardBg))
                             )
                             .border(
                                 1.dp,
-                                if (selected) Color.Transparent else CardBorder,
+                                if (selected) Color.Transparent else cardBorder,
                                 RoundedCornerShape(20.dp)
                             )
                             .clickable { selectedFilter = filter }
@@ -115,7 +128,7 @@ fun StatisticsScreen(vm: AttendanceViewModel) {
                     ) {
                         Text(
                             filter.label,
-                            color = if (selected) Color.White else TextMuted,
+                            color = if (selected) Color.White else textMuted,
                             fontSize = 13.sp,
                             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
                         )
@@ -130,8 +143,8 @@ fun StatisticsScreen(vm: AttendanceViewModel) {
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                SummaryCard("Total Records", "${filtered.size}", ElectricBlue, Icons.Default.EventNote, Modifier.weight(1f))
-                SummaryCard("Unique Students", "$uniqueStudents", NeonPurple, Icons.Default.People, Modifier.weight(1f))
+                SummaryCard("Total Records", "${filtered.size}", ElectricBlue, Icons.Default.EventNote, isLightMode, Modifier.weight(1f))
+                SummaryCard("Unique Students", "$uniqueStudents", NeonPurple, Icons.Default.People, isLightMode, Modifier.weight(1f))
             }
         }
         item {
@@ -139,38 +152,38 @@ fun StatisticsScreen(vm: AttendanceViewModel) {
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                SummaryCard("Today", "$todayCount", SuccessGreen, Icons.Default.Today, Modifier.weight(1f))
-                SummaryCard("Classes", "${byClass.size}", WarnAmber, Icons.Default.School, Modifier.weight(1f))
+                SummaryCard("Today", "$todayCount", SuccessGreen, Icons.Default.Today, isLightMode, Modifier.weight(1f))
+                SummaryCard("Classes", "${byClass.size}", WarnAmber, Icons.Default.School, isLightMode, Modifier.weight(1f))
             }
         }
 
         // Attendance chart (last 7 days)
         if (byDate.isNotEmpty()) {
             item {
-                SectionTitle("Last 7 Days", Icons.Default.BarChart, ElectricBlue)
+                SectionTitle("Last 7 Days", Icons.Default.BarChart, ElectricBlue, isLightMode)
             }
             item {
-                AttendanceBarChart(byDate.map { it.key to it.value.size })
+                AttendanceBarChart(byDate.map { it.key to it.value.size }, isLightMode)
             }
         }
 
         // Class-wise breakdown
         if (byClass.isNotEmpty()) {
             item {
-                SectionTitle("By Class", Icons.Default.School, NeonPurple)
+                SectionTitle("By Class", Icons.Default.School, NeonPurple, isLightMode)
             }
             items(byClass) { (cls, records) ->
-                ClassBreakdownRow(cls, records.size, filtered.size)
+                ClassBreakdownRow(cls, records.size, filtered.size, isLightMode)
             }
         }
 
         // Recent activity
         if (filtered.isNotEmpty()) {
             item {
-                SectionTitle("Recent Activity", Icons.Default.History, WarnAmber)
+                SectionTitle("Recent Activity", Icons.Default.History, WarnAmber, isLightMode)
             }
             items(filtered.take(10)) { record ->
-                RecentActivityItem(record)
+                RecentActivityItem(record, isLightMode)
             }
         }
 
@@ -182,15 +195,15 @@ fun StatisticsScreen(vm: AttendanceViewModel) {
                         .fillMaxWidth()
                         .height(200.dp)
                         .clip(RoundedCornerShape(16.dp))
-                        .background(CardDark)
-                        .border(1.dp, CardBorder, RoundedCornerShape(16.dp)),
+                        .background(cardBg)
+                        .border(1.dp, cardBorder, RoundedCornerShape(16.dp)),
                     contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("📊", fontSize = 40.sp)
                         Spacer(Modifier.height(10.dp))
-                        Text("No data for this period", color = TextMuted, fontSize = 14.sp)
-                        Text("Try a different filter", color = TextMuted.copy(0.5f), fontSize = 12.sp)
+                        Text("No data for this period", color = textMuted, fontSize = 14.sp)
+                        Text("Try a different filter", color = textMuted.copy(0.5f), fontSize = 12.sp)
                     }
                 }
             }
@@ -205,13 +218,18 @@ private fun SummaryCard(
     value: String,
     tint: Color,
     icon: ImageVector,
+    isLightMode: Boolean,
     modifier: Modifier = Modifier
 ) {
+    val cardBg     = if (isLightMode) L_CardBg     else CardDark
+    val cardBorder = if (isLightMode) L_CardBorder else CardBorder
+    val textMuted  = if (isLightMode) L_TextMuted  else TextMuted
+
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(16.dp))
-            .background(CardDark)
-            .border(1.dp, CardBorder, RoundedCornerShape(16.dp))
+            .background(cardBg)
+            .border(1.dp, cardBorder, RoundedCornerShape(16.dp))
             .padding(16.dp)
     ) {
         Column {
@@ -228,32 +246,37 @@ private fun SummaryCard(
             }
             Spacer(Modifier.height(10.dp))
             Text(value, color = tint, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold)
-            Text(label, color = TextMuted, fontSize = 12.sp)
+            Text(label, color = textMuted, fontSize = 12.sp)
         }
     }
 }
 
 // ── Section title ──────────────────────────────────────────────────────────────
 @Composable
-private fun SectionTitle(title: String, icon: ImageVector, tint: Color) {
+private fun SectionTitle(title: String, icon: ImageVector, tint: Color, isLightMode: Boolean) {
+    val textPrimary = if (isLightMode) L_TextPrimary else TextWhite
     Row(verticalAlignment = Alignment.CenterVertically) {
         Icon(icon, null, tint = tint, modifier = Modifier.size(18.dp))
         Spacer(Modifier.width(8.dp))
-        Text(title, color = TextWhite, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+        Text(title, color = textPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
     }
 }
 
 // ── Bar chart (last 7 days) ────────────────────────────────────────────────────
 @Composable
-private fun AttendanceBarChart(data: List<Pair<String, Int>>) {
+private fun AttendanceBarChart(data: List<Pair<String, Int>>, isLightMode: Boolean) {
+    val cardBg     = if (isLightMode) L_CardBg     else CardDark
+    val cardBorder = if (isLightMode) L_CardBorder else CardBorder
+    val textMuted  = if (isLightMode) L_TextMuted  else TextMuted
+
     val maxVal = data.maxOfOrNull { it.second }?.toFloat()?.coerceAtLeast(1f) ?: 1f
 
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
-            .background(CardDark)
-            .border(1.dp, CardBorder, RoundedCornerShape(16.dp))
+            .background(cardBg)
+            .border(1.dp, cardBorder, RoundedCornerShape(16.dp))
             .padding(16.dp)
     ) {
         Column {
@@ -299,7 +322,7 @@ private fun AttendanceBarChart(data: List<Pair<String, Int>>) {
                         val dayLabel = try {
                             date.split("-").getOrNull(2) ?: date
                         } catch (e: Exception) { date }
-                        Text(dayLabel, color = TextMuted, fontSize = 10.sp)
+                        Text(dayLabel, color = textMuted, fontSize = 10.sp)
                     }
                 }
             }
@@ -309,7 +332,12 @@ private fun AttendanceBarChart(data: List<Pair<String, Int>>) {
 
 // ── Class breakdown row ────────────────────────────────────────────────────────
 @Composable
-private fun ClassBreakdownRow(className: String, count: Int, total: Int) {
+private fun ClassBreakdownRow(className: String, count: Int, total: Int, isLightMode: Boolean) {
+    val cardBg      = if (isLightMode) L_CardBg      else CardDark
+    val cardBorder  = if (isLightMode) L_CardBorder  else CardBorder
+    val textPrimary = if (isLightMode) L_TextPrimary else TextWhite
+    val textMuted   = if (isLightMode) L_TextMuted   else TextMuted
+
     val fraction = if (total > 0) count.toFloat() / total else 0f
     val animatedFraction by animateFloatAsState(
         targetValue = fraction,
@@ -321,8 +349,8 @@ private fun ClassBreakdownRow(className: String, count: Int, total: Int) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .background(CardDark)
-            .border(1.dp, CardBorder, RoundedCornerShape(12.dp))
+            .background(cardBg)
+            .border(1.dp, cardBorder, RoundedCornerShape(12.dp))
             .padding(14.dp)
     ) {
         Column {
@@ -342,7 +370,7 @@ private fun ClassBreakdownRow(className: String, count: Int, total: Int) {
                         Icon(Icons.Default.School, null, tint = NeonPurple, modifier = Modifier.size(16.dp))
                     }
                     Spacer(Modifier.width(10.dp))
-                    Text(className, color = TextWhite, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    Text(className, color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                 }
                 Text(
                     "$count records",
@@ -358,7 +386,7 @@ private fun ClassBreakdownRow(className: String, count: Int, total: Int) {
                     .fillMaxWidth()
                     .height(6.dp)
                     .clip(RoundedCornerShape(3.dp))
-                    .background(CardBorder)
+                    .background(cardBorder)
             ) {
                 Box(
                     modifier = Modifier
@@ -371,7 +399,7 @@ private fun ClassBreakdownRow(className: String, count: Int, total: Int) {
             Spacer(Modifier.height(4.dp))
             Text(
                 "${(fraction * 100).toInt()}% of total records",
-                color = TextMuted,
+                color = textMuted,
                 fontSize = 11.sp
             )
         }
@@ -380,7 +408,12 @@ private fun ClassBreakdownRow(className: String, count: Int, total: Int) {
 
 // ── Recent activity item ───────────────────────────────────────────────────────
 @Composable
-private fun RecentActivityItem(record: AttendanceRecordEntity) {
+private fun RecentActivityItem(record: AttendanceRecordEntity, isLightMode: Boolean) {
+    val cardBg      = if (isLightMode) L_CardBg      else CardDark
+    val cardBorder  = if (isLightMode) L_CardBorder  else CardBorder
+    val textPrimary = if (isLightMode) L_TextPrimary else TextWhite
+    val textMuted   = if (isLightMode) L_TextMuted   else TextMuted
+
     val time = remember(record.timestamp) {
         SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date(record.timestamp))
     }
@@ -389,8 +422,8 @@ private fun RecentActivityItem(record: AttendanceRecordEntity) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .background(CardDark)
-            .border(1.dp, CardBorder, RoundedCornerShape(12.dp))
+            .background(cardBg)
+            .border(1.dp, cardBorder, RoundedCornerShape(12.dp))
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -411,8 +444,8 @@ private fun RecentActivityItem(record: AttendanceRecordEntity) {
         }
         Spacer(Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(record.name, color = TextWhite, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Text(record.date, color = TextMuted, fontSize = 11.sp)
+            Text(record.name, color = textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text(record.date, color = textMuted, fontSize = 11.sp)
         }
         Column(horizontalAlignment = Alignment.End) {
             Text(time, color = ElectricBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)

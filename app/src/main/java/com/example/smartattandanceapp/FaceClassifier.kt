@@ -88,6 +88,15 @@ class FaceClassifier(context: Context, modelPath: String = "") {
     }
 
     /**
+     * Checks if at least one face is present in [bitmap].
+     */
+    fun detectFace(bitmap: Bitmap): Boolean {
+        val emb = recognizeFace(bitmap)
+        // If the resulting embedding is all zeros, no face was detected
+        return emb.any { it != 0f }
+    }
+
+    /**
      * Build a 128-D feature vector from ML Kit face landmarks + metadata.
      *
      * Strategy:
